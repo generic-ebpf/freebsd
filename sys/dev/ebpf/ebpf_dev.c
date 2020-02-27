@@ -18,6 +18,11 @@ static struct mtx ebpf_global_mtx;
 #define EBPF_DEV_GLOBAL_LOCK_ASSERT() mtx_assert(&ebpf_global_mtx, MA_OWNED)
 
 /*
+ * Flag to indicate the module is under draining or not
+ */
+static bool draining;
+
+/*
  * Reference count to this module
  */
 static u_int ebpf_global_refcount;
@@ -33,6 +38,70 @@ static struct ebpf_env *ebpf_global_envs[EBPF_ENV_MAX];
  * Common file operations for the eBPF object files.
  */
 static struct fileops ebpf_obj_file_ops;
+
+static __inline void
+global_acquire(void)
+{
+	refcount_acquire(&ebpf_global_refcount);
+}
+
+static __inline bool
+global_release(void)
+{
+	return refcount_release(&ebpf_global_refcount);
+}
+
+static bool
+no_user(void)
+{
+	return (REFCOUNT_COUNT(ebpf_global_refcount) == 0);
+}
+
+int
+ebpf_env_register(uint32_t id, struct ebpf_env *ee)
+{
+	int error = 0;
+
+	if (id >= EBPF_ENV_MAX || ee == NULL)
+		return (EINVAL);
+
+	EBPF_GLOBAL_LOCK();
+
+	if (!draining) {
+		if (ebpf_global_envs[id] == NULL) {
+			ebpf_env_acquire(ee);
+			ebpf_global_envs[id] = ee;
+		} else {
+			error = EINVAL;
+		}
+	} else {
+		error = EPERM;
+	}
+
+	EBPF_GLOBAL_UNLOCK();
+
+	return (error);
+}
+
+struct ebpf_env *
+ebpf_env_unregister(uint32_t id)
+{
+	struct ebpf_env *ee;
+
+	if (id >= EBPF_ENV_MAX)
+		return (NULL);
+
+	EBPF_GLOBAL_LOCK();
+	if (ebpf_global_envs[id] != NULL)
+		ee = ebpf_global_envs[id];
+	else
+		ee = NULL;
+	EBPF_GLOBAL_UNLOCK();
+
+	ebpf_env_release(ee);
+
+	return (ee);
+}
 
 static int
 copyin_alloc(const void *uaddr, void **kaddrp, size_t len)
@@ -166,7 +235,7 @@ ebpf_obj_file_open(struct thread *td, struct file **fpp, int *fdp,
 
 	finit(*fpp, FREAD | FWRITE, DTYPE_NONE, data, &ebpf_obj_file_ops);
 
-	refcount_acquire(&ebpf_global_refcount);
+	global_acquire();
 
 	return (0);
 }
@@ -183,7 +252,7 @@ ebpf_obj_file_close(struct file *fp, struct thread *td)
 
 	if (fp->f_count == 0) {
 		ebpf_obj_release(eo);
-		refcount_release(&ebpf_global_refcount);
+		global_release();
 	}
 
 	return (0);
@@ -552,77 +621,163 @@ static struct cdevsw ebpf_cdevsw = {
 	.d_ioctl = ebpf_ioctl
 };
 
+const static struct ebpf_config ec_kernel = {
+	.prog_types = {
+		[EBPF_PROG_TYPE_UNSPEC] = NULL
+	},
+	.map_types = {
+		[EBPF_MAP_TYPE_UNSPEC] = NULL,
+		[EBPF_MAP_TYPE_ARRAY] = &emt_array,
+		[EBPF_MAP_TYPE_PERCPU_ARRAY] = &emt_percpu_array,
+		[EBPF_MAP_TYPE_HASH] = &emt_hashtable,
+		[EBPF_MAP_TYPE_PERCPU_HASH] = &emt_percpu_hashtable
+	},
+	.helper_types = {
+		[EBPF_HELPER_TYPE_unspec] = NULL,
+		[EBPF_HELPER_TYPE_map_lookup_elem] = &eht_map_lookup_elem,
+		[EBPF_HELPER_TYPE_map_update_elem] = &eht_map_update_elem,
+		[EBPF_HELPER_TYPE_map_delete_elem] = &eht_map_delete_elem
+	},
+	.preprocessor_type = NULL
+};
+
 /*
  * Module operations
  */
+
+static void
+init_globals(void)
+{
+	/* Initialize the global lock */
+	EBPF_DEV_GLOBAL_LOCK_INIT();
+
+	/* Initialize the global refcount */
+	refcount_init(&ebpf_global_refcount, 1);
+
+	/* Initialize the global environment registry */
+	memcpy(ebpf_global_envs, 0,
+			sizeof(*ebpf_global_envs) * EBPF_ENV_MAX);
+
+	/* Initialize the eBPF object file operations */
+	memcpy(&ebpf_obj_file_ops, &badfileops, sizeof(ebpf_obj_file_ops));
+	ebpf_obj_file_ops.fo_close = ebpf_obj_file_close;
+}
+
+static int
+create_cdev(void)
+{
+	ebpf_dev = make_dev_credf(MAKEDEV_ETERNAL_KLD, &ebpf_cdevsw,
+			0, NULL, UID_ROOT, GID_WHEEL, 0600, "ebpf");
+	if (ebpf_dev == NULL) {
+		return (EINVAL);
+	}
+
+	return 0;
+}
+
+static void
+destroy_cdev(void)
+{
+	destroy_dev(ebpf_dev);
+}
+
+static int
+register_envs(void)
+{
+	int error;
+	struct ebpf_env *ee_kernel;
+
+	/*
+	 * Register kernel environment
+	 */
+	error = ebpf_env_create(&ee_kernel, &ec_kernel);
+	if (error != 0)
+		return (error);
+
+	error = ebpf_env_register(EBPF_ENV_KERNEL, ee_kernel);
+	if (error != 0)
+		goto err0;
+
+	return (error);
+
+err0:
+	ebpf_env_destroy(ee_kernel);
+	return (error);
+}
+
+static void
+unregister_envs(void)
+{
+	int error;
+	struct ebpf_env *ee;
+
+	ee = ebpf_env_unregister(EBPF_ENV_KERNEL);
+	KASSERT(ee != NULL, "Failed to unregister kernel environment");
+
+	error = ebpf_env_destroy(ee);
+	KASSERT(error != 0, "Failed to destroy kernel environment");
+}
+
+static void
+start_draining(void)
+{
+	/*
+	 * Shut-out the users by removing the cdev
+	 */
+	destroy_cdev();
+
+	/*
+	 * Unregister all built-in environments
+	 */
+	unregister_envs();
+
+	/*
+	 * Turn on the draining flag
+	 */
+	EBPF_DEV_GLOBAL_LOCK();
+	draining = true;
+	EBPF_DEV_GLOBAL_UNLOCK();
+}
 
 static int
 ebpf_load(void)
 {
 	int error;
 
-	/*
-	 * Initialize the eBPF library
-	 */
+	init_globals();
+
 	error = ebpf_init();
 	if (error != 0)
 		return error;
 
-	/*
-	 * Initialize globals
-	 */
-	EBPF_DEV_GLOBAL_LOCK_INIT();
+	error = register_envs();
+	if (error != 0)
+		goto err0;
 
-	refcount_init(&ebpf_global_refcount, 1);
-
-	for (uint32_t i = 0; i < EBPF_ENV_MAX; i++)
-		ebpf_global_envs[i] = NULL;
-
-	memcpy(&ebpf_obj_file_ops, &badfileops, sizeof(ebpf_obj_file_ops));
-	ebpf_obj_file_ops.fo_close = ebpf_obj_file_close;
-
-	/*
-	 * Initialize the character device
-	 */
-	ebpf_dev = make_dev_credf(MAKEDEV_ETERNAL_KLD, &ebpf_cdevsw,
-			0, NULL, UID_ROOT, GID_WHEEL, 0600, "ebpf");
-	if (ebpf_dev == NULL) {
-		error = ebpf_deinit();
-		KASSERT(error == 0, "ebpf_deinit failed");
-		return EINVAL;
-	}
+	error = create_cdev();
+	if (error != 0)
+		goto err1;
 
 	return 0;
+
+err1:
+	unregister_envs();
+err0:
+	KASSERT(ebpf_deinit() == 0, "ebpf_deinit failed");
+	return (error);
 }
 
 static int
 ebpf_unload(void)
 {
-	int error = 0;
+	EBPF_DEV_GLOBAL_LOCK();
 
-	/*
-	 * Shut out the users by deleting the char device
-	 */
-	if (ebpf_dev != NULL) {
-		destroy_dev(ebpf_dev);
-		ebpf_dev = NULL;
-	}
+	if (!draining)
+		start_draining();
 
-	/*
-	 * Check the reference count of this module. If the users
-	 * are left, take a reference again and return EBUSY.
-	 */
-	if (refcount_release(&ebpf_global_refcount)) {
-		for (uint32_t i = 0; i < EBPF_ENV_MAX; i++) {
-			if (ebpf_global_envs[i] != NULL)
-				ebpf_env_destroy(ebpf_global_envs[i]);
-		}
-	} else {
-		error = EBUSY;
-		refcount_acquire(&ebpf_global_refcount);
-	}
+	EBPF_DEV_GLOBAL_UNLOCK();
 
-	return (error);
+	return (no_user() ? 0 : EBUSY)
 }
 
 static int

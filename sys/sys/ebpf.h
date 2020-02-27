@@ -23,12 +23,11 @@ enum ebpf_map_types {
 	EBPF_MAP_TYPE_PERCPU_HASH
 };
 
-enum ebpf_func_ids {
-	EBPF_FUNC_unspec,
-	EBPF_FUNC_map_lookup_elem,
-	EBPF_FUNC_map_update_elem,
-	EBPF_FUNC_map_delete_elem,
-	__EBPF_FUNC_MAX_ID
+enum ebpf_helper_types {
+	EBPF_HELPER_TYPE_unspec,
+	EBPF_HELPER_TYPE_map_lookup_elem,
+	EBPF_HELPER_TYPE_map_update_elem,
+	EBPF_HELPER_TYPE_map_delete_elem
 };
 
 struct ebpf_load_prog_req {
@@ -79,3 +78,8 @@ struct ebpf_map_get_next_key_req {
 #define EBPFIOC_MAP_UPDATE_ELEM _IOW('i', 154, struct ebpf_map_update_req)
 #define EBPFIOC_MAP_DELETE_ELEM _IOW('i', 155, struct ebpf_map_delete_req)
 #define EBPFIOC_MAP_GET_NEXT_KEY _IOWR('i', 156, struct ebpf_map_get_next_key_req)
+
+#ifdef _KERNEL
+int ebpf_env_register(uint32_t id, struct ebpf_env *ee);
+struct ebpf_env *ebpf_env_unregister(uint32_t id);
+#endif
